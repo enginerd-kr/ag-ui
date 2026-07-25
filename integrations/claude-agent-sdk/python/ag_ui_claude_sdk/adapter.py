@@ -6,7 +6,7 @@ import logging
 import json
 import uuid
 from datetime import datetime
-from typing import AsyncIterator, Optional, List, Dict, Any, Union, TYPE_CHECKING
+from typing import AsyncIterator, Callable, Optional, List, Dict, Any, Union, TYPE_CHECKING
 
 from ag_ui.core import (
     EventType,
@@ -74,9 +74,19 @@ if not logger.handlers:
 class ClaudeAgentAdapter:
     """
     AG-UI adapter for the Anthropic Claude Agent SDK.
-    
+
     Manages the SDK client lifecycle internally via per-thread session workers.
     Call ``run(input_data)`` to get an async iterator of AG-UI events.
+
+    Note on ``options["system_prompt"]`` and shared state: ``build_options()``
+    appends a "Current Shared State" block to ``system_prompt`` only when a
+    thread's ``SessionWorker`` is first created -- every later turn on that
+    thread reuses the same worker (and its already-built ``system_prompt``)
+    unchanged, so that block reflects turn 1's state for the rest of the
+    session, not the latest ``RunAgentInput.state``. If a use case needs the
+    model to see up-to-date shared state on every turn, pass
+    ``state_context_builder`` instead: it runs on every ``run()`` call
+    (worker created or reused) against the actual outgoing prompt.
     """
 
     def __init__(
@@ -87,6 +97,7 @@ class ClaudeAgentAdapter:
         max_workers: int = 1000,
         worker_ttl_seconds: float = 1800,   # 30 min
         query_timeout_seconds: Optional[float] = 300,   # 5 min; bounds a hung/slow worker
+        state_context_builder: Optional[Callable[[RunAgentInput, str], str]] = None,
     ):
         self.name = name
         self.description = description
@@ -94,6 +105,16 @@ class ClaudeAgentAdapter:
         self._max_workers = max_workers
         self._worker_ttl_seconds = worker_ttl_seconds
         self._query_timeout_seconds = query_timeout_seconds
+        # Applied to the outgoing prompt on EVERY run() call (mirrors
+        # ag_ui_strands's StateContextBuilder) -- unlike the system_prompt
+        # addendum built by build_state_context_addendum(), which only runs
+        # once when a thread's SessionWorker is first created (see run()
+        # below), the prompt string is genuinely fresh every turn regardless
+        # of worker reuse, so this is the one place per-turn state changes can
+        # still reach the model on a resumed session. Applying it here (to the
+        # local prompt only) rather than rebuilding system_prompt every turn
+        # also keeps Claude's prompt-caching prefix stable across turns.
+        self._state_context_builder = state_context_builder
         # thread_id -> {"worker": SessionWorker, "last_used": datetime, "active": bool, "active_runs": int}
         self._workers: Dict[str, Dict] = {}
         self._state_locks: Dict[str, asyncio.Lock] = {}
@@ -346,6 +367,11 @@ class ClaudeAgentAdapter:
                 logger.debug(f"Reusing worker for thread={thread_id}")
 
             prompt, _ = process_messages(input_data)
+            if self._state_context_builder:
+                try:
+                    prompt = self._state_context_builder(input_data, prompt)
+                except Exception as e:
+                    logger.warning(f"state_context_builder failed: {e}", exc_info=True)
             message_stream = worker.query(prompt, session_id=thread_id)
 
             # Log parent_run_id if provided (for branching/time travel tracking)

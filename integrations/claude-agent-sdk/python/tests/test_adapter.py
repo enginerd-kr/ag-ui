@@ -539,6 +539,145 @@ class TestBuildOptions:
         assert opts.max_turns == 3
 
 
+class _RecordingWorker:
+    """A SessionWorker stand-in that records every prompt passed to query(),
+    so tests can assert what actually reached the model regardless of
+    whether the worker was just created or reused across turns."""
+
+    recorded_prompts: list = []
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def start(self):
+        pass
+
+    def is_alive(self):
+        return True
+
+    def query(self, prompt, session_id="default"):
+        _RecordingWorker.recorded_prompts.append(prompt)
+
+        async def _gen():
+            return
+            yield  # pragma: no cover
+
+        return _gen()
+
+    async def stop(self):
+        pass
+
+
+class TestStateContextBuilder:
+    """state_context_builder must run on EVERY run() call, not just when a
+    thread's worker is first created -- that's the whole point of the fix:
+    build_state_context_addendum()'s system_prompt injection only happens
+    once (worker creation), so a reused worker's system_prompt is frozen
+    from turn 1 and never reflects later RunAgentInput.state. The prompt
+    string built fresh by process_messages() every turn is the one thing
+    state_context_builder can still enrich regardless of worker reuse."""
+
+    @pytest.mark.asyncio
+    async def test_builder_applied_on_first_turn(self, make_input, monkeypatch):
+        _RecordingWorker.recorded_prompts = []
+        monkeypatch.setattr("ag_ui_claude_sdk.adapter.SessionWorker", _RecordingWorker)
+        seen = []
+
+        def builder(input_data, prompt):
+            seen.append(input_data.state)
+            return f"[state={input_data.state}] {prompt}"
+
+        adapter = ClaudeAgentAdapter(name="t", state_context_builder=builder)
+        inp = make_input(
+            thread_id="th1",
+            state={"notes": ["a"]},
+            messages=[{"id": "1", "role": "user", "content": "hi"}],
+        )
+        async for _ in adapter.run(inp):
+            pass
+
+        assert seen == [{"notes": ["a"]}]
+        assert _RecordingWorker.recorded_prompts == ["[state={'notes': ['a']}] hi"]
+
+    @pytest.mark.asyncio
+    async def test_builder_applied_on_reused_worker_turn(self, make_input, monkeypatch):
+        # This is the exact bug the fix addresses: a second run on the same
+        # thread_id reuses the existing worker (see run()'s `else:` branch),
+        # so without this fix, nothing built from turn-2 state would ever
+        # reach the model. state_context_builder must fire again here.
+        _RecordingWorker.recorded_prompts = []
+        monkeypatch.setattr("ag_ui_claude_sdk.adapter.SessionWorker", _RecordingWorker)
+        calls = []
+
+        def builder(input_data, prompt):
+            calls.append(input_data.state)
+            return f"[state={input_data.state}] {prompt}"
+
+        adapter = ClaudeAgentAdapter(name="t", state_context_builder=builder)
+
+        inp1 = make_input(
+            thread_id="th1",
+            state={"notes": []},
+            messages=[{"id": "1", "role": "user", "content": "hi"}],
+        )
+        async for _ in adapter.run(inp1):
+            pass
+
+        inp2 = make_input(
+            thread_id="th1",
+            state={"notes": ["hello world"]},
+            messages=[
+                {"id": "1", "role": "user", "content": "hi"},
+                {"id": "2", "role": "assistant", "content": "hi!"},
+                {"id": "3", "role": "user", "content": "what's in notes?"},
+            ],
+        )
+        async for _ in adapter.run(inp2):
+            pass
+
+        assert calls == [{"notes": []}, {"notes": ["hello world"]}]
+        assert _RecordingWorker.recorded_prompts[-1] == (
+            "[state={'notes': ['hello world']}] what's in notes?"
+        )
+
+    @pytest.mark.asyncio
+    async def test_builder_exception_falls_back_to_original_prompt(self, make_input, monkeypatch):
+        _RecordingWorker.recorded_prompts = []
+        monkeypatch.setattr("ag_ui_claude_sdk.adapter.SessionWorker", _RecordingWorker)
+
+        def bad_builder(input_data, prompt):
+            raise RuntimeError("boom")
+
+        adapter = ClaudeAgentAdapter(name="t", state_context_builder=bad_builder)
+        inp = make_input(
+            thread_id="th1",
+            state={"notes": []},
+            messages=[{"id": "1", "role": "user", "content": "hi"}],
+        )
+        async for _ in adapter.run(inp):
+            pass  # must not raise
+
+        assert _RecordingWorker.recorded_prompts == ["hi"]
+
+    @pytest.mark.asyncio
+    async def test_no_builder_leaves_prompt_unchanged(self, make_input, monkeypatch):
+        # Regression guard: adapters that don't pass state_context_builder
+        # (the default) must see byte-identical behavior to before this fix.
+        _RecordingWorker.recorded_prompts = []
+        monkeypatch.setattr("ag_ui_claude_sdk.adapter.SessionWorker", _RecordingWorker)
+
+        adapter = ClaudeAgentAdapter(name="t")
+        inp = make_input(
+            thread_id="th1",
+            state={"notes": ["a"]},
+            messages=[{"id": "1", "role": "user", "content": "hi"}],
+        )
+        async for _ in adapter.run(inp):
+            pass
+
+        assert _RecordingWorker.recorded_prompts == ["hi"]
+
+
 class _FakeFailingWorker:
     """A SessionWorker stand-in whose query raises immediately."""
 

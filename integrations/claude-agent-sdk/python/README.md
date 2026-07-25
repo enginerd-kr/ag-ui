@@ -19,6 +19,30 @@ adapter = ClaudeAgentAdapter(name="my_agent", options={"model": "claude-haiku-4-
 add_claude_fastapi_endpoint(app=app, adapter=adapter, path="/my_agent")
 ```
 
+## Keeping Shared State Fresh Across Turns
+
+Threads reuse one long-lived `SessionWorker` per `thread_id`, so `options["system_prompt"]`
+(and the "Current Shared State" block the adapter appends to it) is only built once, on a
+thread's first turn — later turns reuse that same worker without rebuilding it. If your use
+case updates shared state after turn 1 and needs the model to see the latest value every turn
+(e.g. a human-in-the-loop approval flag, a collaboratively-edited list), pass
+`state_context_builder`:
+
+```python
+adapter = ClaudeAgentAdapter(
+    name="my_agent",
+    options={"model": "claude-haiku-4-5"},
+    state_context_builder=lambda input_data, prompt: (
+        f"Current shared state: {input_data.state}\n\n{prompt}"
+    ),
+)
+```
+
+Unlike `system_prompt`, this runs on **every** `run()` call regardless of whether the thread's
+worker is being created or reused, so it stays accurate turn after turn. It only affects the
+prompt text sent to the model for that call — `RunAgentInput.messages` and everything echoed
+back to the AG-UI client (`MESSAGES_SNAPSHOT`, etc.) are untouched.
+
 ## Features
 
 - **Full lifecycle management** - Handles client pooling, message extraction, and event translation internally
